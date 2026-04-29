@@ -30,6 +30,7 @@ import logging.config
 import os
 import pathlib
 import platform
+import sqlite3
 import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timedelta
@@ -43,6 +44,7 @@ from dateutil import parser as dateutil_parser
 from httpx import HTTPStatusError
 
 import omronconnect as OC
+import storage as ST
 import utils as U
 
 ########################################################################################################################
@@ -1121,7 +1123,13 @@ def device_edit(device: DeviceType) -> bool:
 
 
 def omron_sync_device_to_garmin(
-    oc: OC.OmronClient, gc: GC.Garmin, ocDev: OC.OmronDevice, startLocal: int, endLocal: int, opts: Options
+    oc: OC.OmronClient,
+    gc: GC.Garmin,
+    ocDev: OC.OmronDevice,
+    startLocal: int,
+    endLocal: int,
+    opts: Options,
+    db: T.Optional[sqlite3.Connection] = None,
 ) -> None:
     if endLocal - startLocal <= 0:
         L.info("Invalid date range")
@@ -1147,6 +1155,10 @@ def omron_sync_device_to_garmin(
         return
 
     L.info(f"Downloaded {len(measurements)} entries from 'OMRON connect' for '{ocDev.name}'")
+
+    if db is not None:
+        added, skipped = ST.store_measurements(db, measurements)
+        L.info(f"SQLite: stored {added} new, skipped {skipped} duplicate(s) for '{ocDev.name}'")
     first_ts = datetime.fromtimestamp(measurements[0].measurementDate / 1000).isoformat()
     last_ts = datetime.fromtimestamp(measurements[-1].measurementDate / 1000).isoformat()
     L.debug(f"Measurement date range: {first_ts} to {last_ts}")
@@ -1912,6 +1924,13 @@ def remove_device(ctx: click.Context, devname: str):
     show_default=True,
     help="Do not write to Garmin Connect.",
 )
+@click.option(
+    "--db",
+    "db_path",
+    type=click.Path(),
+    default=None,
+    help="Also store measurements to a local SQLite database file.",
+)
 @click.pass_context
 @requires_config
 def sync_device(
@@ -1923,6 +1942,7 @@ def sync_device(
     to_date: T.Optional[str],
     overwrite: bool,
     no_write: bool,
+    db_path: T.Optional[str],
 ):
     """Sync DEVNAMES... to Garmin Connect.
 
@@ -2025,10 +2045,13 @@ def sync_device(
         L.info("Failed to login to OMRON connect or Garmin Connect.")
         return
 
+    db = ST.open_db(db_path) if db_path else None
     for device in devices:
         ocDev = OC.OmronDevice(**device)
-        omron_sync_device_to_garmin(oc, gc, ocDev, startLocal, endLocal, opts=opts)
+        omron_sync_device_to_garmin(oc, gc, ocDev, startLocal, endLocal, opts=opts, db=db)
         L.info(f"Device '{device['name']}' successfully synced.")
+    if db:
+        db.close()
 
 
 ########################################################################################################################
@@ -2625,6 +2648,144 @@ def export_json(
             data.append(entry)
 
     U.json_save(output, data)
+
+
+########################################################################################################################
+
+
+@omron_group.command(name="store")
+@click.argument("devnames", required=False, nargs=-1)
+@click.option(
+    "--db",
+    "db_path",
+    required=True,
+    type=click.Path(),
+    help="SQLite database file path (created if it does not exist).",
+)
+@click.option(
+    "--category",
+    "-c",
+    "device_category",
+    required=False,
+    type=click.Choice(list(OC.DeviceCategory.__members__.keys()), case_sensitive=False),
+)
+@click.option("--days", default=None, type=click.INT, help="Number of days. Can combine with --from or --to.")
+@click.option(
+    "--from",
+    "from_date",
+    type=click.STRING,
+    default=None,
+    help="Start date (yyyymmdd or yyyy-mm-dd). Can combine with --days or --to.",
+)
+@click.option(
+    "--to",
+    "to_date",
+    type=click.STRING,
+    default=None,
+    help="End date (yyyymmdd or yyyy-mm-dd). Can combine with --days or --from.",
+)
+@click.pass_context
+@requires_config
+def store_to_db(
+    ctx: click.Context,
+    devnames: T.Tuple[str, ...],
+    db_path: str,
+    device_category: T.Optional[str],
+    days: T.Optional[int],
+    from_date: T.Optional[str],
+    to_date: T.Optional[str],
+) -> None:
+    """Store OMRON measurements to a local SQLite database (no Garmin needed).
+
+    \b
+    Date Range Options:
+        --days N              Store last N days from today (default: 0, today only)
+        --from DATE           Start date (yyyymmdd or yyyy-mm-dd format)
+        --to DATE             End date (yyyymmdd or yyyy-mm-dd format)
+        --from DATE --to DATE Explicit date range
+        --from DATE --days N  Start date plus N days
+        --to DATE --days N    End date minus N days
+
+    \b
+    Examples:
+        # Store all devices for the last 30 days
+        omramin omron store --db omron.db --days 30
+    \b
+        # Store only blood-pressure devices
+        omramin omron store --db omron.db --category BPM --days 7
+    \b
+        # Store with an explicit date range
+        omramin omron store --db omron.db --from 2024-01-01 --to 2024-01-31
+    """
+
+    config_path = ctx.obj["config_path"]
+
+    try:
+        config = U.json_load(config_path)
+
+    except FileNotFoundError:
+        L.error(f"Config file '{config_path}' not found.")
+        return
+
+    category = OC.DeviceCategory[device_category] if device_category else None
+    devices = config.get("omron", {}).get("devices", [])
+
+    if days is None and from_date is None and to_date is None:
+        days = 0
+
+    try:
+        startLocal, endLocal = calculate_date_range_from_options(
+            from_date=from_date,
+            to_date=to_date,
+            days=days,
+        )
+
+    except DateRangeException as e:
+        L.error(f"Invalid date range: {e}")
+        return
+
+    except ValueError as e:
+        L.error(f"Date parsing error: {e}")
+        return
+
+    devices = filter_devices(devices, devnames=list(devnames), category=category)
+    if not devices:
+        L.info("No matching devices found")
+        return
+
+    startdateStr = datetime.fromtimestamp(startLocal).date().isoformat()
+    enddateStr = datetime.fromtimestamp(endLocal).date().isoformat()
+
+    try:
+        oc = omron_login(config_path)
+
+    except LoginError:
+        L.info("Failed to login to OMRON connect.")
+        return
+
+    if not oc:
+        return
+
+    db = ST.open_db(db_path)
+    for device in devices:
+        ocDev = OC.OmronDevice(**device)
+        if startdateStr == enddateStr:
+            L.info(f"Fetching '{ocDev.name}' for {startdateStr}")
+        else:
+            L.info(f"Fetching '{ocDev.name}' from {startdateStr} to {enddateStr}")
+
+        measurements = oc.get_measurements(
+            ocDev, searchDateFrom=int(startLocal * 1000), searchDateTo=int(endLocal * 1000)
+        )
+        if not measurements:
+            L.info("No measurements found")
+            continue
+
+        L.info(f"Downloaded {len(measurements)} entries for '{ocDev.name}'")
+        added, skipped = ST.store_measurements(db, measurements)
+        L.info(f"Stored {added} new, skipped {skipped} duplicate(s) for '{ocDev.name}'")
+
+    db.close()
 
 
 ########################################################################################################################
