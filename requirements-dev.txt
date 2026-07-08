@@ -1,4 +1,6 @@
-garminconnect
+requests
+curl-cffi
+ua-generator
 click
 brotlicffi
 httpx[http2,cli,brotli]

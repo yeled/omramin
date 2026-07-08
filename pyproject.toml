@@ -8,7 +8,7 @@ classifiers = [
 ]
 dependencies = [
   "click>=8.1.7",
-  "garminconnect>=0.3.0",
+  "curl-cffi>=0.7.0",
   "httpx[http2,cli,brotli]>=0.28.1",
   "inquirer>=3.4.0",
   "json5>=0.10.0",
@@ -16,6 +16,8 @@ dependencies = [
   "keyrings.alt>=5.0.0; sys_platform == 'win32'",
   "python-dateutil>=2.9.0.post0",
   "pytz>=2025.1",
+  "requests>=2.31.0",
+  "ua-generator>=1.0.0",
   "click-pwsh>=0.9.5; sys_platform == 'win32'",
   "selectolax>=0.4.6",
 ]
@@ -53,8 +55,9 @@ version = { attr = "omramin.__version__" }
 exclude = [] # exclude packages matching these glob patterns (empty by default) 
 include = [
   "omramin",
+  "garmin_client",
   "data",
-] # package names should match these glob patterns (["*"] by default) 
+] # package names should match these glob patterns (["*"] by default)
 namespaces = false # to disable scanning PEP 420 namespaces (true by default)
 where = ["."] # list of folders that contain the packages (["."] by default) 
 
@@ -139,7 +142,9 @@ module = [
   "bleak",
   "bleak.exc",
   "pytz",
-  "garminconnect",
+  "curl_cffi",
+  "curl_cffi.requests.exceptions",
+  "ua_generator",
   "inquirer",
   "python-dateutil",
   "dateutil",
@@ -172,6 +177,8 @@ per-file-ignores = [
   # max complexity, whitespace before ':', line break before binary operator
   "omramin.py:C901,E203,W503", # ignore all checks in tests
   "tests/*:E,W,F,C",
+  # vendored Garmin Connect client (keep close to upstream)
+  "garmin_client/*:C901,W503",
 ]
 
 [tool.isort]

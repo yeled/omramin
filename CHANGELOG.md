@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.4.0
+
+- **Garmin auth vendored**: Replaced the `garminconnect` dependency with a vendored `garmin_client` package (from [garminspo2](https://github.com/yeled/garminspo2)). Uses a five-strategy SSO fallback chain with `curl_cffi` TLS fingerprinting and DI OAuth2 tokens with rotating-refresh persistence, fixing sessions expiring every ~2 days. Tokens are still stored in the keyring; a one-time re-login is required to migrate from the old token format.
+
 ## v0.3.0
 
 - **Garmin auth rewritten**: Migrated to garminconnect>=0.3.0 due to Garmin SSO/OAuth changes; replaces garth-based authentication. Re-login required.
