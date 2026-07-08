@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #   "click>=8.1.7",
-#   "garminconnect>=0.3.0",
+#   "curl-cffi>=0.7.0",
 #   "httpx[http2,cli,brotli]>=0.28.1",
 #   "inquirer>=3.4.0",
 #   "json5>=0.10.0",
@@ -11,6 +11,8 @@
 #   "keyrings.alt>=5.0.0; sys_platform == 'win32'",
 #   "python-dateutil>=2.9.0.post0",
 #   "pytz>=2025.1",
+#   "requests>=2.31.0",
+#   "ua-generator>=1.0.0",
 #   "click-pwsh>=0.9.5; sys_platform == 'win32'",
 #   "selectolax>=0.4.6",
 # ]
@@ -21,7 +23,6 @@
 import typing as T  # isort: split
 
 import asyncio
-import binascii
 import csv
 import dataclasses
 import enum
@@ -37,12 +38,12 @@ from datetime import datetime, timedelta
 from functools import cache, wraps
 
 import click
-import garminconnect as GC
 import inquirer
 import keyring
 from dateutil import parser as dateutil_parser
 from httpx import HTTPStatusError
 
+import garmin_client as GC
 import omronconnect as OC
 import storage as ST
 import utils as U
@@ -59,7 +60,7 @@ except ImportError:
 
 ########################################################################################################################
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 ########################################################################################################################
 
@@ -77,7 +78,7 @@ class Options:
 class MeasurementSyncHandler:
     """Handler for syncing specific measurement types"""
 
-    fetch_garmin_data: T.Callable[[GC.Garmin, str, str], T.Dict[str, T.Any]]  # e.g., garmin_get_weighins
+    fetch_garmin_data: T.Callable[[GC.GarminClient, str, str], T.Dict[str, T.Any]]  # e.g., garmin_get_weighins
     delete_measurement: T.Callable  # e.g., gc.delete_weigh_in
     add_measurement: T.Callable[[datetime, T.Any, Options], None]  # e.g., add scale/BP measurement
     measurement_type: T.Type  # OC.WeightMeasurement or OC.BPMeasurement
@@ -146,7 +147,7 @@ LOGGING_CONFIG = {
             "propagate": False,
             "formatter": "root",
         },
-        "garminconnect": {
+        "garmin_client": {
             "handlers": ["default"],
             "level": logging.INFO,
             "formatter": "root",
@@ -178,8 +179,8 @@ if _E("OMRAMIN_OMRON_DEBUG"):
     L.debug("OMRON debug enabled")
 
 if _E("OMRAMIN_GARMIN_DEBUG"):
-    logging.getLogger("garminconnect").setLevel(logging.DEBUG)
-    logging.getLogger("garminconnect").disabled = False
+    logging.getLogger("garmin_client").setLevel(logging.DEBUG)
+    logging.getLogger("garmin_client").disabled = False
     L.debug("Garmin debug enabled")
 
 
@@ -190,8 +191,8 @@ def _configure_logging_levels(debug: bool = False) -> None:
         # Debug: everything at DEBUG level
         logging.getLogger("").setLevel(logging.DEBUG)
         logging.getLogger("omronconnect").setLevel(logging.DEBUG)
-        logging.getLogger("garminconnect").setLevel(logging.DEBUG)
-        logging.getLogger("garminconnect").disabled = False
+        logging.getLogger("garmin_client").setLevel(logging.DEBUG)
+        logging.getLogger("garmin_client").disabled = False
         L.debug("Debug mode enabled (all loggers at DEBUG level)")
 
 
@@ -261,7 +262,7 @@ def prompt_credentials(
     return answers
 
 
-def garmin_login(config_path: str) -> T.Optional[GC.Garmin]:
+def garmin_login(config_path: str) -> T.Optional[GC.GarminClient]:
     """Login to Garmin Connect"""
 
     try:
@@ -278,6 +279,14 @@ def garmin_login(config_path: str) -> T.Optional[GC.Garmin]:
     def get_mfa() -> str:
         return inquirer.text(message="> Enter MFA/2FA code")
 
+    def persist_tokens(tokendata: str) -> None:
+        # Garmin rotates the refresh token on each use; keep the keyring current
+        if email:
+            save_service_tokens(config_path, "garmin", email, tokendata)
+
+    def garmin_domain(is_cn: bool) -> str:
+        return "garmin.cn" if is_cn else "garmin.com"
+
     try:
         # Load tokens from keyring (requires email)
         tokendata = None
@@ -288,13 +297,25 @@ def garmin_login(config_path: str) -> T.Optional[GC.Garmin]:
             raise FileNotFoundError
 
         is_cn = gcCfg.get("is_cn", False)
-        gc = GC.Garmin(email=email, is_cn=is_cn, prompt_mfa=get_mfa)
 
         L.debug(f"Attempting Garmin login using cached tokens for {email}")
-        gc.login(tokenstore=tokendata)
+        gc = GC.GarminClient.from_token_string(
+            tokendata,
+            domain=garmin_domain(is_cn),
+            token_persist_hook=persist_tokens,
+        )
         L.debug(f"Garmin login successful using cached tokens for {email}")
 
-    except (FileNotFoundError, binascii.Error, KeyError, GC.GarminConnectAuthenticationError):
+    except GC.GarminTooManyRequestsError:
+        L.error("Failed to login to Garmin Connect", exc_info=True)
+        return None
+
+    except (FileNotFoundError, GC.GarminAuthenticationError, GC.GarminConnectionError) as token_error:
+        # Cached tokens are missing, expired, or in the legacy garminconnect/garth
+        # format -> fall back to a credential login
+        if not isinstance(token_error, FileNotFoundError):
+            L.debug(f"Cached token login failed: {token_error}")
+
         # Precedence: env > config > prompt
         password = _E("GARMIN_PASSWORD")
         is_cn_str = _E("GARMIN_IS_CN") or str(gcCfg.get("is_cn", "false"))
@@ -324,11 +345,11 @@ def garmin_login(config_path: str) -> T.Optional[GC.Garmin]:
         if not email or not password:
             raise LoginError("Missing credentials") from None
 
-        gc = GC.Garmin(email=email, password=password, is_cn=is_cn, prompt_mfa=get_mfa)
+        gc = GC.GarminClient(domain=garmin_domain(is_cn))
         try:
-            gc.login()
+            gc.login(email, password, prompt_mfa=get_mfa)
 
-        except GC.GarminConnectAuthenticationError as login_error:
+        except GC.GarminAuthenticationError as login_error:
             L.error(f"Login failed: {login_error}")
             L.info("Please re-enter your credentials")
 
@@ -353,12 +374,20 @@ def garmin_login(config_path: str) -> T.Optional[GC.Garmin]:
             is_cn = answers["is_cn"]
 
             # Retry login with new credentials
-            gc = GC.Garmin(email=email, password=password, is_cn=is_cn, prompt_mfa=get_mfa)
+            gc = GC.GarminClient(domain=garmin_domain(is_cn))
             try:
-                gc.login()
+                gc.login(email, password, prompt_mfa=get_mfa)
 
-            except GC.GarminConnectAuthenticationError as e:
+            except GC.GarminAuthenticationError as e:
                 raise LoginError(f"Login failed: {e}") from e
+
+            except (GC.GarminTooManyRequestsError, GC.GarminConnectionError):
+                L.error("Failed to login to Garmin Connect", exc_info=True)
+                return None
+
+        except (GC.GarminTooManyRequestsError, GC.GarminConnectionError):
+            L.error("Failed to login to Garmin Connect", exc_info=True)
+            return None
 
         # Save credentials to config (if not from env vars)
         config_changed = False
@@ -378,12 +407,9 @@ def garmin_login(config_path: str) -> T.Optional[GC.Garmin]:
             except (OSError, IOError, ValueError) as e:
                 L.warning(f"Failed to save config: {e}")
 
-        # Save tokens to keyring
-        save_service_tokens(config_path, "garmin", email, gc.client.dumps())  # pylint: disable=no-member
-
-    except (GC.GarminConnectTooManyRequestsError, GC.GarminConnectConnectionError):
-        L.error("Failed to login to Garmin Connect", exc_info=True)
-        return None
+        # Save tokens to keyring and keep them current across refreshes
+        save_service_tokens(config_path, "garmin", email, gc.dumps())
+        gc.token_persist_hook = persist_tokens
 
     L.info("Logged in to Garmin Connect")
     return gc
@@ -1124,7 +1150,7 @@ def device_edit(device: DeviceType) -> bool:
 
 def omron_sync_device_to_garmin(
     oc: OC.OmronClient,
-    gc: GC.Garmin,
+    gc: GC.GarminClient,
     ocDev: OC.OmronDevice,
     startLocal: int,
     endLocal: int,
@@ -1232,7 +1258,7 @@ def sync_measurements(
     L.debug(f"Sync complete: {added} added, {skipped} skipped")
 
 
-def _add_scale_measurement(gc: GC.Garmin, dtLocal: datetime, wm: OC.WeightMeasurement, opts: Options) -> None:
+def _add_scale_measurement(gc: GC.GarminClient, dtLocal: datetime, wm: OC.WeightMeasurement, opts: Options) -> None:
     """Add a scale measurement to Garmin Connect."""
 
     datetimeStr = dtLocal.isoformat(timespec="seconds")
@@ -1261,7 +1287,7 @@ def _add_scale_measurement(gc: GC.Garmin, dtLocal: datetime, wm: OC.WeightMeasur
         L.debug("Scale measurement written successfully")
 
 
-def _add_bp_measurement(gc: GC.Garmin, dtLocal: datetime, bpm: OC.BPMeasurement, opts: Options) -> None:
+def _add_bp_measurement(gc: GC.GarminClient, dtLocal: datetime, bpm: OC.BPMeasurement, opts: Options) -> None:
     """Add a blood pressure measurement to Garmin Connect."""
 
     datetimeStr = dtLocal.isoformat(timespec="seconds")
@@ -1294,7 +1320,7 @@ def _add_bp_measurement(gc: GC.Garmin, dtLocal: datetime, bpm: OC.BPMeasurement,
 
 
 def sync_scale_measurements(
-    gc: GC.Garmin, gcData: T.Dict[str, T.Any], measurements: T.List[OC.MeasurementTypes], opts: Options
+    gc: GC.GarminClient, gcData: T.Dict[str, T.Any], measurements: T.List[OC.MeasurementTypes], opts: Options
 ):
     """Sync scale measurements using the generic sync_measurements function."""
 
@@ -1310,7 +1336,7 @@ def sync_scale_measurements(
 
 
 def sync_bp_measurements(
-    gc: GC.Garmin, gcData: T.Dict[str, T.Any], measurements: T.List[OC.MeasurementTypes], opts: Options
+    gc: GC.GarminClient, gcData: T.Dict[str, T.Any], measurements: T.List[OC.MeasurementTypes], opts: Options
 ):
     """Sync blood pressure measurements using the generic sync_measurements function."""
 
@@ -1325,7 +1351,7 @@ def sync_bp_measurements(
     sync_measurements(gcData, measurements, handler, opts)
 
 
-def garmin_get_bp_measurements(gc: GC.Garmin, startdate: str, enddate: str) -> T.Dict[str, str]:
+def garmin_get_bp_measurements(gc: GC.GarminClient, startdate: str, enddate: str) -> T.Dict[str, str]:
     # search dates are in local time
     gcData = gc.get_blood_pressure(startdate=startdate, enddate=enddate)
 
@@ -1343,7 +1369,7 @@ def garmin_get_bp_measurements(gc: GC.Garmin, startdate: str, enddate: str) -> T
     return gcMeasurements
 
 
-def garmin_get_weighins(gc: GC.Garmin, startdate: str, enddate: str) -> T.Dict[str, str]:
+def garmin_get_weighins(gc: GC.GarminClient, startdate: str, enddate: str) -> T.Dict[str, str]:
     # search dates are in local time
     gcData = gc.get_weigh_ins(startdate=startdate, enddate=enddate)
 

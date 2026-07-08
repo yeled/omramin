@@ -1,8 +1,10 @@
 bleak==2.0.0
 click==8.3.1
-garminconnect==0.2.34
+curl-cffi==0.15.0
 httpx[http2,cli,brotli]==0.28.1
 inquirer==3.4.1
 json5==0.12.1
 python-dateutil==2.9.0.post0
 pytz==2025.2
+requests==2.34.2
+ua-generator==2.1.2
