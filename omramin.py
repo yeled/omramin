@@ -1262,7 +1262,7 @@ def sync_measurements(
         handler.add_measurement(dtLocal, measurement, opts)  # type: ignore[arg-type]
         added += 1
 
-    L.debug(f"Sync complete: {added} added, {skipped} skipped")
+    L.info(f"Sync complete: {added} {handler.log_name} added, {skipped} already in Garmin Connect")
 
 
 def _add_scale_measurement(gc: GC.GarminClient, dtLocal: datetime, wm: OC.WeightMeasurement, opts: Options) -> None:
